@@ -5,7 +5,7 @@ Microsoft To Do – Complete MCP Server
 A Model Context Protocol (MCP) server that gives any MCP-compatible AI client
 full read/write access to Microsoft To Do via Microsoft Graph API.
 
-28 tools covering every To Do endpoint:
+30 tools covering every To Do endpoint:
   • Task Lists          – list, create, get, update, delete
   • Tasks               – list, create, get, update, delete, complete
   • Checklist Items     – list, create, get, update, delete
@@ -13,39 +13,64 @@ full read/write access to Microsoft To Do via Microsoft Graph API.
   • Attachments (beta)  – list, create, get, delete
   • Convenience         – find_list_by_name, find_task_by_title
   • Sync                – delta query for incremental task sync
+  • Auth                – start_auth, finish_auth (first-time setup)
 
-Quick Deploy (GitHub → mcpdeploy.dev → Copilot Studio)
-------------------------------------------------------
-1.  Push this repo to GitHub:
-        microsoft-todo-mcp/
-        ├── microsoft_todo_mcp_server.py
-        ├── requirements.txt          # mcp[cli], httpx
-        └── README.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SETUP (one-time, ~5 minutes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-2.  Go to https://mcpdeploy.dev  (or https://www.mcphosting.io)
-      • Sign in with GitHub
-      • Select your repo
-      • Click Deploy
-      • Set environment variables (see step 3)
-      • Copy the URL, e.g. https://your-mcp.mcpdeploy.dev/mcp
+Step 1 – Register a free app (no credit card, no paid plan):
 
-3.  Set environment variables in the hosting dashboard:
+  1. Go to https://entra.microsoft.com and sign in with your Microsoft account
+     (the same account you use for To Do)
+  2. Identity → Applications → App registrations → New registration
+  3. Name: "MS To Do MCP"
+     Supported account types: "Personal Microsoft accounts only"
+  4. Click Register → copy the Application (client) ID
+  5. Authentication → Add a platform → Mobile and desktop applications
+     → check: https://login.microsoftonline.com/common/oauth2/nativeclient → Configure
+     → Advanced settings: "Allow public client flows" → Yes → Save
+  6. API permissions → Add a permission → Microsoft Graph → Delegated
+     → add Tasks.ReadWrite and User.Read → Grant admin consent
 
-        AZURE_CLIENT_ID=your-client-id
-        AZURE_TENANT_ID=your-tenant-id
-        AZURE_CLIENT_SECRET=your-client-secret
+Step 2 – Get your refresh token (run locally):
 
-    OR for quick testing (token expires in ~1 hour):
+    pip install "mcp[cli]" httpx
+    export AZURE_CLIENT_ID=<paste-client-id-from-step-1>
+    python auth.py
+    # Follow the sign-in instructions printed to the terminal
+    # Copy the GRAPH_REFRESH_TOKEN printed at the end
 
-        GRAPH_ACCESS_TOKEN=eyJ0eX...
+Step 3 – Deploy to Fly.io:
 
-4.  In Copilot Studio → Tools → Add a tool → New tool → MCP:
-        Server name:        Microsoft To Do
-        Server description: Full CRUD access to Microsoft To Do
-        Server URL:         https://your-mcp.mcpdeploy.dev/mcp
-        Authentication:     None  (or API key)
+    fly launch --copy-config --yes
+    fly secrets set AZURE_CLIENT_ID=<...> GRAPH_REFRESH_TOKEN=<...>
 
-    Hit Create — all 28 tools are discovered automatically.
+    Your MCP URL: https://<app-name>.fly.dev/mcp
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ LOCAL DEVELOPMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    export AZURE_CLIENT_ID=<...>
+    export GRAPH_REFRESH_TOKEN=<...>
+    python microsoft_todo_mcp_server.py
+    # Starts on http://localhost:3000/mcp
+
+Claude Desktop (add to claude_desktop_config.json):
+    {
+      "mcpServers": {
+        "microsoft-todo": {
+          "command": "python",
+          "args": ["/full/path/to/microsoft_todo_mcp_server.py"],
+          "env": {
+            "AZURE_CLIENT_ID": "...",
+            "GRAPH_REFRESH_TOKEN": "...",
+            "MCP_TRANSPORT": "stdio"
+          }
+        }
+      }
+    }
 
 Local Development
 -----------------
@@ -86,6 +111,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import logging
 from typing import Any, Optional
 
@@ -103,7 +129,9 @@ log = logging.getLogger("todo-mcp")
 # ─── Constants ───
 GRAPH_V1 = "https://graph.microsoft.com/v1.0"
 GRAPH_BETA = "https://graph.microsoft.com/beta"
-TOKEN_URL_TPL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+SCOPE = "Tasks.ReadWrite User.Read offline_access"
+TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+DEVICE_CODE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
 
 # ─── MCP Server ───
 mcp = FastMCP(
@@ -120,46 +148,144 @@ mcp = FastMCP(
 #  AUTH HELPERS
 # ═══════════════════════════════════════════════════════════
 
-_cached_token: dict[str, Any] = {}
+_token_cache: dict[str, Any] = {}
 
 
 async def _get_token() -> str:
-    """Return a valid access token, using client-credentials or env var."""
-    static_token = os.environ.get("GRAPH_ACCESS_TOKEN")
-    if static_token:
-        return static_token
+    """Return a valid delegated access token.
+
+    Priority:
+      1. GRAPH_ACCESS_TOKEN env var (static, for quick testing — expires ~1h)
+      2. GRAPH_REFRESH_TOKEN + AZURE_CLIENT_ID (production — auto-refreshes)
+
+    Run auth.py once locally to obtain GRAPH_REFRESH_TOKEN.
+    """
+    static = os.environ.get("GRAPH_ACCESS_TOKEN")
+    if static:
+        return static
 
     client_id = os.environ.get("AZURE_CLIENT_ID", "")
-    tenant_id = os.environ.get("AZURE_TENANT_ID", "")
-    client_secret = os.environ.get("AZURE_CLIENT_SECRET", "")
+    refresh_token = os.environ.get("GRAPH_REFRESH_TOKEN", "")
 
-    if not all([client_id, tenant_id, client_secret]):
+    if not client_id or not refresh_token:
         raise RuntimeError(
-            "Set GRAPH_ACCESS_TOKEN or all of AZURE_CLIENT_ID, "
-            "AZURE_TENANT_ID, AZURE_CLIENT_SECRET."
+            "Authentication not configured. "
+            "Run auth.py locally to get GRAPH_REFRESH_TOKEN, then set:\n"
+            "  AZURE_CLIENT_ID=<your-app-client-id>\n"
+            "  GRAPH_REFRESH_TOKEN=<token-from-auth.py>"
         )
 
-    import time
-
-    if _cached_token.get("expires_at", 0) > time.time() + 60:
-        return _cached_token["access_token"]
-
-    url = TOKEN_URL_TPL.format(tenant=tenant_id)
-    data = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://graph.microsoft.com/.default",
-        "grant_type": "client_credentials",
-    }
+    if _token_cache.get("expires_at", 0) > time.time() + 60:
+        return _token_cache["access_token"]
 
     async with httpx.AsyncClient() as client:
-        resp = await client.post(url, data=data)
+        resp = await client.post(TOKEN_URL, data={
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": SCOPE,
+        })
         resp.raise_for_status()
         body = resp.json()
 
-    _cached_token["access_token"] = body["access_token"]
-    _cached_token["expires_at"] = time.time() + body.get("expires_in", 3600)
-    return body["access_token"]
+    _token_cache["access_token"] = body["access_token"]
+    _token_cache["expires_at"] = time.time() + body.get("expires_in", 3600)
+    if "refresh_token" in body:
+        _token_cache["refresh_token"] = body["refresh_token"]
+        log.info("Refresh token rotated — update GRAPH_REFRESH_TOKEN env var if needed")
+
+    return _token_cache["access_token"]
+
+
+# ═══════════════════════════════════════════════════════════
+#  SETUP TOOL (device code flow for first-time auth)
+# ═══════════════════════════════════════════════════════════
+
+_pending_device: dict[str, Any] = {}
+
+
+@mcp.tool()
+async def start_auth(client_id: str) -> str:
+    """Start the one-time Microsoft sign-in flow (device code).
+
+    Call this the very first time to get a sign-in URL and code.
+    Then open the URL in your browser, enter the code, and sign in
+    with your personal Microsoft account. Once done, call finish_auth
+    to get your GRAPH_REFRESH_TOKEN to save as an env var.
+
+    Args:
+        client_id: Your Azure app's Client ID (from entra.microsoft.com).
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(DEVICE_CODE_URL, data={
+            "client_id": client_id,
+            "scope": SCOPE,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+
+    _pending_device.update(data)
+    _pending_device["client_id"] = client_id
+
+    return json.dumps({
+        "instructions": [
+            f"1. Open this URL: {data['verification_uri']}",
+            f"2. Enter this code: {data['user_code']}",
+            "3. Sign in with your Microsoft account (the one you use for To Do)",
+            "4. Come back and call finish_auth to get your refresh token",
+        ],
+        "url": data["verification_uri"],
+        "code": data["user_code"],
+        "expires_in_seconds": data.get("expires_in", 900),
+    }, indent=2)
+
+
+@mcp.tool()
+async def finish_auth() -> str:
+    """Complete the sign-in started by start_auth and return your refresh token.
+
+    Call this after you have signed in at the URL from start_auth.
+    Save the GRAPH_REFRESH_TOKEN value as a permanent env var.
+    """
+    if not _pending_device:
+        return json.dumps({"error": "Call start_auth first."})
+
+    client_id = _pending_device["client_id"]
+    device_code = _pending_device["device_code"]
+    deadline = time.time() + _pending_device.get("expires_in", 900)
+
+    async with httpx.AsyncClient() as client:
+        while time.time() < deadline:
+            resp = await client.post(TOKEN_URL, data={
+                "client_id": client_id,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+            })
+            body = resp.json()
+
+            if "access_token" in body:
+                _pending_device.clear()
+                return json.dumps({
+                    "success": True,
+                    "message": "Authenticated! Save these as env vars on your hosting platform:",
+                    "AZURE_CLIENT_ID": client_id,
+                    "GRAPH_REFRESH_TOKEN": body["refresh_token"],
+                    "fly_command": (
+                        f"fly secrets set "
+                        f"AZURE_CLIENT_ID={client_id} "
+                        f"GRAPH_REFRESH_TOKEN={body['refresh_token']}"
+                    ),
+                }, indent=2)
+
+            error = body.get("error", "")
+            if error == "authorization_pending":
+                await __import__("asyncio").sleep(5)
+            elif error == "slow_down":
+                await __import__("asyncio").sleep(10)
+            else:
+                return json.dumps({"error": error, "detail": body})
+
+    return json.dumps({"error": "Code expired. Call start_auth again."})
 
 
 # ═══════════════════════════════════════════════════════════
